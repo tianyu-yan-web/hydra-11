@@ -116,6 +116,8 @@ class Aggregation():
         self.args = args
         self.server_lr = args.server_lr
         self.n_params = n_params
+        # Persist previous global params to compute temporal direction (TDA) properly
+        self.prev_global_params = None
 
         if self.args.aggr == 'foolsgold':
             self.memory_dict = dict()
@@ -164,6 +166,8 @@ class Aggregation():
             [global_model.state_dict()[name] for name in global_model.state_dict()]).detach()
         new_global_params = (cur_global_params + lr_vector * aggregated_updates).float()
         vector_to_model(new_global_params, global_model)
+        # Update temporal reference after applying this round
+        self.prev_global_params = cur_global_params.clone().detach()
         return updates_dict, neurotoxin_mask, reputation_scores
 
     def agg_hydra(self, agent_updates_dict, global_model, reputation_scores):
@@ -255,24 +259,35 @@ class Aggregation():
             logging.warning("No trusted seeds found. Returning zero update.")
             return torch.zeros_like(agent_updates_list[0]), reputation_scores
 
+        # Compute Temporal Direction Alignment (TDA) against prior global update direction
         tda_scores = []
         cos = torch.nn.CosineSimilarity(dim=0, eps=1e-6)
-        flat_global_model = parameters_to_vector([p.data for p in global_model.parameters()]).detach()
-        for update in agent_updates_list:
-            tda_scores.append(cos(update, flat_global_model).item())
+        # Prefer temporal direction: theta_t-1 - theta_t-2. If unavailable, use mean of trusted seeds' updates later
+        if hasattr(self, 'prev_global_params') and self.prev_global_params is not None:
+            current_flat = parameters_to_vector([p.data for p in global_model.parameters()]).detach()
+            global_direction = (current_flat - self.prev_global_params)
+        else:
+            global_direction = None
+        if global_direction is not None and torch.norm(global_direction) > 1e-12:
+            for update in agent_updates_list:
+                tda_scores.append(cos(update, global_direction).item())
+        else:
+            # Fallback: use average of all updates as proxy direction
+            proxy_direction = torch.mean(torch.stack(agent_updates_list, dim=0), dim=0)
+            for update in agent_updates_list:
+                tda_scores.append(cos(update, proxy_direction).item())
         logging.info('TDA Scores: %s' % [round(s, 4) for s in tda_scores])
 
         mpsa_scores = []
         inter_model_updates = torch.stack(agent_updates_list, dim=0)
-        major_sign = torch.sign(torch.sum(torch.sign(inter_model_updates), dim=0))
+        # Compute major sign using only trusted seeds to reduce attacker influence
+        seed_updates = inter_model_updates[trusted_seed_indices] if len(trusted_seed_indices) > 0 else inter_model_updates
+        major_sign = torch.sign(torch.sum(torch.sign(seed_updates), dim=0))
         for update in agent_updates_list:
-            k = int(len(update) * self.args.sparsity)
-            if k > 0:
-                _, topk_indices = torch.topk(torch.abs(update), k)
-                agreement = torch.sum(torch.sign(update[topk_indices]) == major_sign[topk_indices])
-                score = (agreement / k).item()
-            else:
-                score = 0.0
+            k = max(1, int(len(update) * self.args.sparsity))
+            _, topk_indices = torch.topk(torch.abs(update), k)
+            agreement = torch.sum(torch.sign(update[topk_indices]) == major_sign[topk_indices])
+            score = (agreement.float() / float(k)).item()
             mpsa_scores.append(score)
         logging.info('MPSA Scores: %s' % [round(s, 4) for s in mpsa_scores])
 
